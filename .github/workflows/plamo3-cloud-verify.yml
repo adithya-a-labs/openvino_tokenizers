@@ -1,0 +1,67 @@
+name: PLaMo 3 public verifier on Linux
+
+on:
+  push:
+    branches:
+      - codex/plamo3-cloud-verification
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TARGET_COMMIT: cee81d04787432004b5e5cc9c28392a0ea546f29
+      GIST_RAW: https://gist.githubusercontent.com/adithya-a-labs/88ad19011860e97c655042116bcdf848/raw
+      CMAKE_GENERATOR: Ninja
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+    steps:
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Get the public Gist and exact source commit
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source fetch --depth=1 https://github.com/adithya-a-labs/openvino_tokenizers.git "$TARGET_COMMIT"
+          git -C source switch --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$TARGET_COMMIT"
+          curl --fail --silent --show-error --location --retry 3 "$GIST_RAW/README.md" -o gist-README.md
+          curl --fail --silent --show-error --location --retry 3 "$GIST_RAW/verify_plamo3.py" -o verify_plamo3.py
+          grep -Fq "$TARGET_COMMIT" gist-README.md
+          uname -m
+          python --version
+          git -C source log -1 --format='%H %s'
+          sha256sum verify_plamo3.py
+      - name: Build and install the Linux candidate from the Gist instructions
+        working-directory: source
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12
+          source .venv/bin/activate
+          wheel='https://storage.openvinotoolkit.org/wheels/nightly/openvino/openvino-2027.0.0.dev20261119-23953-cp312-cp312-manylinux_2_28_x86_64.whl'
+          uv pip install "$wheel" 'py-build-cmake==0.4.3' 'cmake>=3.16,<4' ninja
+          uv pip install --no-build-isolation --no-deps .
+          uv pip uninstall py-build-cmake
+          uv pip install 'transformers==5.23.0' 'tokenizers==0.23.3' 'numba==0.68.1' 'jinja2==3.1.6'
+          uv pip check
+      - name: Run the published verifier on CPU
+        run: |
+          set -euo pipefail
+          source source/.venv/bin/activate
+          python verify_plamo3.py --work-dir plamo3-verification | tee parity-summary.txt
+          grep -Fq 'encoder published corpus: 310/310 exact matches' parity-summary.txt
+          grep -Fq 'PFML3 chat BOS count: 1/1 exact matches' parity-summary.txt
+          grep -Fq 'decoder (skip_special_tokens=False): 612/612 exact matches' parity-summary.txt
+          grep -Fq 'decoder (skip_special_tokens=True): 612/612 exact matches' parity-summary.txt
+          cat parity-summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: plamo3-linux-verifier-report
+          path: |
+            parity-summary.txt
+            plamo3-verification/parity-results.json
+          if-no-files-found: ignore
