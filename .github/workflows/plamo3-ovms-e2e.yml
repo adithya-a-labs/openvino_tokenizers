@@ -85,7 +85,9 @@ jobs:
         run: |
           set -euo pipefail
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/ovms/lib"
+          export PYTHONPATH="$GITHUB_WORKSPACE/ovms/lib/python:/usr/lib/python3/dist-packages"
           export OPENVINO_TOKENIZERS_PATH_GENAI="$GITHUB_WORKSPACE/ovms/lib/libopenvino_tokenizers.so"
+          python -c 'import jinja2; print("Jinja2:", jinja2.__version__, jinja2.__file__)'
           ./ovms/bin/ovms --model_path "$GITHUB_WORKSPACE/model" --model_name plamo3-translate \
             --task text_generation --target_device CPU --rest_port 8000 --cache_size 1 \
             --tool_parser none --reasoning_parser none --chat_template_engine jinja > evidence/ovms.log 2>&1 &
