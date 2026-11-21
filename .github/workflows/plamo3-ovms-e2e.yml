@@ -1,0 +1,131 @@
+name: PLaMo 3 translation through OVMS
+
+on:
+  push:
+    branches:
+      - codex/plamo3-ovms-e2e
+
+permissions:
+  contents: read
+
+jobs:
+  translate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TARGET_COMMIT: cee81d04787432004b5e5cc9c28392a0ea546f29
+      MODEL_REVISION: 8faa0bec947c07c30a7e69c092b2b8f8b5693eb5
+      PFN_REVISION: c5a33c561bc6a4fbac38c3460bbb384e15c0b231
+      OVMS_ARCHIVE: https://storage.openvinotoolkit.org/repositories/openvino_model_server/packages/weekly/latest/ovms_ubuntu24.tar.gz?versionId=Xp2sLtmFMwBK2Zuzk78gJKh0gYWqt2fJ
+      OVMS_SHA256: fab8a65fa3ef895190fdb611c9aff682f20ca08d461c684ae22c4f4fcb49ffa8
+      CMAKE_GENERATOR: Ninja
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+      HF_HUB_DOWNLOAD_TIMEOUT: '120'
+    steps:
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Fetch branch source and OVMS runtime
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git init source
+          git -C source fetch --depth=1 https://github.com/adithya-a-labs/openvino_tokenizers.git "$TARGET_COMMIT"
+          git -C source switch --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$TARGET_COMMIT"
+          git init workflow
+          git -C workflow fetch --depth=1 https://github.com/adithya-a-labs/openvino_tokenizers.git "$GITHUB_SHA"
+          git -C workflow switch --detach FETCH_HEAD
+          curl -fLsS --retry 3 "$OVMS_ARCHIVE" -o ovms.tar.gz
+          printf '%s  ovms.tar.gz\n' "$OVMS_SHA256" | sha256sum -c
+          tar -xzf ovms.tar.gz
+          test -f ovms/lib/libopenvino.so.2650
+          ./ovms/bin/ovms --version | tee evidence/ovms-version.txt
+          sudo apt-get install -y libxml2 libpython3.12 python3-jinja2
+      - name: Build the exact branch and export stock PLaMo tokenizer IRs
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 export-env
+          source export-env/bin/activate
+          wheel='https://storage.openvinotoolkit.org/wheels/nightly/openvino/openvino-2027.0.0.dev20261119-23953-cp312-cp312-manylinux_2_28_x86_64.whl'
+          uv pip install "$wheel" 'py-build-cmake==0.4.3' 'cmake>=3.16,<4' ninja
+          cd source
+          uv pip install --no-build-isolation --no-deps --config-setting=override=cmake.build_path="$GITHUB_WORKSPACE/export-build" .
+          cd ..
+          uv pip uninstall py-build-cmake
+          uv pip install 'transformers==5.23.0' 'tokenizers==0.23.3' 'numba==0.68.1' 'jinja2==3.1.6'
+          export MODEL_DIR="$GITHUB_WORKSPACE/model"
+          python workflow/.github/scripts/stage-plamo3-model.py
+          sha256sum model/openvino_{tokenizer,detokenizer}.{xml,bin} | tee evidence/ir-sha256.txt
+      - name: Build the same native extension for the OVMS runtime ABI
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 server-sdk
+          source server-sdk/bin/activate
+          wheel='https://storage.openvinotoolkit.org/wheels/nightly/openvino/openvino-2026.5.0rc3-23836-cp312-cp312-manylinux_2_28_x86_64.whl'
+          uv pip install "$wheel" 'cmake>=3.16,<4' ninja
+          cp -a source server-extension-source
+          sed -i 's/VERSION 2027\.0\.0\.0/VERSION 2026.5.0.0/' server-extension-source/CMakeLists.txt
+          test "$(git -C server-extension-source diff --name-only)" = "CMakeLists.txt"
+          git -C server-extension-source diff -- CMakeLists.txt | tee evidence/ovms-build-version-adjustment.diff
+          cmake -S server-extension-source -B server-extension-build \
+            -DPython3_EXECUTABLE="$VIRTUAL_ENV/bin/python" -DCMAKE_BUILD_TYPE=Release \
+            -DFETCHCONTENT_SOURCE_DIR_SENTENCEPIECE="$GITHUB_WORKSPACE/export-build/_deps/sentencepiece-src" \
+            -DFETCHCONTENT_SOURCE_DIR_PCRE2="$GITHUB_WORKSPACE/export-build/_deps/pcre2-src"
+          cmake --build server-extension-build --parallel 4 --target openvino_tokenizers
+          extension="$GITHUB_WORKSPACE/server-extension-build/src/libopenvino_tokenizers.so"
+          readelf -d "$extension" | grep -F '[libopenvino.so.2650]'
+          cp --remove-destination "$extension" ovms/lib/libopenvino_tokenizers.so
+          cp --remove-destination "$extension" ovms/lib/python/openvino_tokenizers/lib/libopenvino_tokenizers.so
+          sha256sum "$extension" ovms/lib/libopenvino_tokenizers.so | tee evidence/server-extension-sha256.txt
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/ovms/lib" ldd -r "$extension" > evidence/server-extension-ldd.txt
+          if grep -E 'not found|undefined symbol' evidence/server-extension-ldd.txt; then exit 1; fi
+      - name: Serve PLaMo and send a real translation request
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/ovms/lib"
+          export OPENVINO_TOKENIZERS_PATH_GENAI="$GITHUB_WORKSPACE/ovms/lib/libopenvino_tokenizers.so"
+          ./ovms/bin/ovms --model_path "$GITHUB_WORKSPACE/model" --model_name plamo3-translate \
+            --task text_generation --target_device CPU --rest_port 8000 --cache_size 1 \
+            --tool_parser none --reasoning_parser none --chat_template_engine jinja > evidence/ovms.log 2>&1 &
+          server_pid=$!
+          trap 'rc=$?; kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then tail -100 evidence/ovms.log; fi' EXIT
+          ready=0
+          for attempt in $(seq 1 90); do
+            kill -0 "$server_pid"
+            if curl -fsS --max-time 3 http://127.0.0.1:8000/v3/models -o evidence/models.json 2>/dev/null \
+              && grep -q plamo3-translate evidence/models.json; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" -eq 1
+          cat > evidence/request.json <<'JSON'
+          {"model":"plamo3-translate","messages":[{"role":"user","content":"The cat is sleeping on the sofa."}],"chat_template_kwargs":{"source_lang":"en","target_lang":"ja"},"temperature":0,"max_tokens":64,"stream":false}
+          JSON
+          http_status=$(curl -sS --max-time 180 -o evidence/response.json -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary @evidence/request.json \
+            http://127.0.0.1:8000/v3/chat/completions)
+          printf 'HTTP status: %s\n' "$http_status" | tee evidence/http-status.txt
+          cat evidence/response.json
+          test "$http_status" = 200
+          grep -F 'libopenvino_tokenizers.so' "/proc/$server_pid/maps" | awk '{print $NF}' | sort -u | tee evidence/loaded-tokenizer-library.txt
+          grep -Fq "$OPENVINO_TOKENIZERS_PATH_GENAI" evidence/loaded-tokenizer-library.txt
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path("evidence/response.json").read_text())
+          choice = result["choices"][0]
+          text = choice["message"]["content"].strip()
+          assert choice["finish_reason"] == "stop", result
+          assert any(cat in text for cat in ("猫", "ねこ", "ネコ")) and "ソファ" in text, repr(text)
+          print("Japanese translation:", text)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: plamo3-ovms-translation-evidence
+          path: evidence/
+          if-no-files-found: ignore
