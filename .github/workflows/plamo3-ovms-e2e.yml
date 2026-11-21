@@ -90,7 +90,6 @@ jobs:
           python -c 'import jinja2; print("Jinja2:", jinja2.__version__, jinja2.__file__)'
           ./ovms/bin/ovms --model_path "$GITHUB_WORKSPACE/model" --model_name plamo3-translate \
             --task text_generation --target_device CPU --rest_port 8000 --cache_size 1 \
-            --plugin_config '{"INFERENCE_PRECISION_HINT":"f32","KV_CACHE_PRECISION":"f32"}' \
             --tool_parser none --reasoning_parser none --chat_template_engine jinja > evidence/ovms.log 2>&1 &
           server_pid=$!
           trap 'rc=$?; kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; if [ "$rc" -ne 0 ]; then tail -100 evidence/ovms.log; fi' EXIT
