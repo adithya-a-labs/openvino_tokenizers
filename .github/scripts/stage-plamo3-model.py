@@ -1,4 +1,5 @@
 """Create the OVMS model directory using the branch's tokenizer export."""
+import json
 import os
 from pathlib import Path
 
@@ -23,11 +24,18 @@ snapshot_download(
                     "tokenizer.jsonl", "chat_template.jinja", "config.json"],
 )
 pfn = AutoTokenizer.from_pretrained(str(reference_path), trust_remote_code=True, local_files_only=True)
-tokenizer, detokenizer = convert_tokenizer(pfn, with_detokenizer=True, add_special_tokens=False)
+context_length = json.loads((model_dir / "config.json").read_text())["max_position_embeddings"]
+tokenizer, detokenizer = convert_tokenizer(
+    pfn, with_detokenizer=True, add_special_tokens=False, max_length=context_length,
+)
 tokenizer_path = model_dir / "openvino_tokenizer.xml"
 ov.save_model(tokenizer, tokenizer_path)
 ov.save_model(detokenizer, model_dir / "openvino_detokenizer.xml")
 assert 'type="PlamoTokenizer"' in tokenizer_path.read_text(encoding="utf-8")
 for name in ["tokenizer_config.json", "chat_template.jinja", "special_tokens_map.json"]:
     (model_dir / name).write_bytes((reference_path / name).read_bytes())
-print("Generated stock PFN tokenizer and detokenizer IRs with", ov.get_version())
+config_path = model_dir / "tokenizer_config.json"
+tokenizer_config = json.loads(config_path.read_text())
+tokenizer_config["model_max_length"] = context_length
+config_path.write_text(json.dumps(tokenizer_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print("Generated stock PFN tokenizer and detokenizer IRs with", ov.get_version(), "and context", context_length)
