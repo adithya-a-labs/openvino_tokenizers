@@ -5,6 +5,7 @@ from pathlib import Path
 
 import openvino as ov
 from huggingface_hub import snapshot_download
+from openvino.preprocess import PrePostProcessor
 from openvino_tokenizers import convert_tokenizer
 from transformers import AutoTokenizer
 
@@ -15,6 +16,22 @@ snapshot_download(
     local_dir=model_dir,
     allow_patterns=["openvino_model.xml", "openvino_model.bin", "config.json", "generation_config.json"],
 )
+model_path = model_dir / "openvino_model.xml"
+model = ov.Core().read_model(model_path)
+if model.output("logits").get_element_type() == ov.Type.bf16:
+    # This GenAI build reads logits through a float pointer. Preserve the model
+    # computation and convert its public result tensor only.
+    adapter = PrePostProcessor(model)
+    adapter.output(0).tensor().set_element_type(ov.Type.f32)
+    adapted = adapter.build()
+    adapted.output(0).tensor.set_names({"logits"})
+    assert adapted.output("logits").get_element_type() == ov.Type.f32
+    adapted_path = model_dir / "fp32_logits.xml"
+    ov.save_model(adapted, adapted_path, compress_to_fp16=False)
+    adapted_path.replace(model_path)
+    adapted_path.with_suffix(".bin").replace(model_path.with_suffix(".bin"))
+    print("Adapted the public logits from BF16 to FP32 for OVMS 2026.5")
+
 reference_path = Path("pfn-tokenizer")
 snapshot_download(
     "pfnet/plamo-3-translate-0.8b",
